@@ -1,0 +1,31 @@
+services:
+  pico:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    environment:
+      PICO_DISCORD_BOT_TOKEN: "${PICO_DISCORD_BOT_TOKEN:?Set PICO_DISCORD_BOT_TOKEN in Coolify}"
+      PICO_CHANNEL_ID: "${PICO_CHANNEL_ID:?Set PICO_CHANNEL_ID in Coolify}"
+      PICO_REDDIT_CLIENT_ID: "${PICO_REDDIT_CLIENT_ID:-}"
+      PICO_REDDIT_CLIENT_SECRET: "${PICO_REDDIT_CLIENT_SECRET:-}"
+      PICO_REDDIT_USER_AGENT: "${PICO_REDDIT_USER_AGENT:-}"
+      PICO_ALBUM_NAMES: "${PICO_ALBUM_NAMES:?Set PICO_ALBUM_NAMES in Coolify}"
+      PICO_ARCHIVE_SEARCH_TAG: "${PICO_ARCHIVE_SEARCH_TAG:?Set PICO_ARCHIVE_SEARCH_TAG in Coolify}"
+      DISCORD_USER_ID: "${DISCORD_USER_ID:?Set DISCORD_USER_ID in Coolify}"
+      DISCORD_CHANNEL_ID: "${DISCORD_CHANNEL_ID:?Set DISCORD_CHANNEL_ID in Coolify}"
+      DISCORD_GUILD_ID: "${DISCORD_GUILD_ID:-}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      PICO_GOOGLE_CREDENTIALS_BASE64: "${PICO_GOOGLE_CREDENTIALS_BASE64:-}"
+      PICO_GOOGLE_TOKEN_BASE64: "${PICO_GOOGLE_TOKEN_BASE64:-}"
+      PICO_GOOGLE_CREDENTIALS_PATH: /app/data/google-photos-credentials.json
+      PICO_GOOGLE_TOKEN_PATH: /app/data/google-photos-token.json
+      PICO_DATA_PATH: /app/data/pico.db
+      PICO_MEDIA_PATH: /app/data/media
+    volumes:
+      - pico-data:/app/data
+
+volumes:
+  pico-data:
