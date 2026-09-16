@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import discord
 import pytest
 
 from pico_photo_bot.config import PicoSettings
@@ -58,6 +59,42 @@ def prepared_import(root: Path, *, count=2, declared_size=3):
         tuple(images),
     )
     return PreparedImport("prepared", source, tuple(files))
+
+
+def prepared_webpage(root: Path, *, count=3, omitted=0, skipped=0):
+    media = root / "media" / "webpage"
+    media.mkdir(parents=True, exist_ok=True)
+    files = []
+    images = []
+    for ordinal in range(1, count + 1):
+        path = media / f"photo-{ordinal:02d}.jpg"
+        path.write_bytes(f"photo-{ordinal}".encode())
+        credit = f"Photographer {ordinal}"
+        files.append(
+            PreparedFile(
+                ordinal, path, path.name, "image/jpeg", path.stat().st_size
+            )
+        )
+        images.append(
+            SourceImage(
+                ordinal,
+                f"https://cdn.example/{ordinal}.jpg",
+                attribution_label=credit,
+                attribution_sentence=(
+                    f"Photo credit: {credit} — https://publisher.example/story"
+                ),
+            )
+        )
+    source = SourcePost(
+        "webpage",
+        "https://publisher.example/story",
+        "publisher.example",
+        "Source: publisher.example — https://publisher.example/story",
+        tuple(images),
+    )
+    return PreparedImport(
+        "webpage", source, tuple(files), omitted_count=omitted, skipped_count=skipped
+    )
 
 
 class Typing:
@@ -356,3 +393,120 @@ async def test_album_selection_rechecks_user_allowlist(tmp_path: Path):
     assert interaction.followup.sent[0][0] == (
         "Only configured Pico users can upload these images."
     )
+
+
+@pytest.mark.asyncio
+async def test_webpage_delivers_independent_controls_and_album_uploads(
+    tmp_path: Path,
+):
+    config = settings(tmp_path)
+    store = PicoStore(config.data_path)
+    await store.initialize()
+    prepared = prepared_webpage(tmp_path, count=3, omitted=2, skipped=1)
+    channel = Channel()
+    photos = UploadPhotos(store, outcomes=(1, 1))
+    bot = HarnessPicoBot(
+        config, store, Loader(prepared), photos, channels=(channel,)
+    )
+
+    await bot._prepare_message(
+        IncomingMessage("https://publisher.example/story", channel),
+        "https://publisher.example/story",
+    )
+
+    photo_messages = channel.sent[:3]
+    views = [payload[1]["view"] for payload in photo_messages]
+    assert all(len(payload[1]["files"]) == 1 for payload in photo_messages)
+    assert all(isinstance(view, PicoControlView) for view in views)
+    assert len({view.import_id for view in views}) == 3
+    assert channel.sent[3][0] == (
+        "Webpage import: 3 prepared, 3 delivered, 1 skipped, "
+        "2 omitted by the 20-photo limit."
+    )
+
+    first = Interaction()
+    second = Interaction()
+    await bot.upload_to_album(first, views[0].import_id, "Family")
+    await bot.upload_to_album(second, views[1].import_id, "Reference")
+
+    uploaded_first = await store.get_import(views[0].import_id)
+    uploaded_second = await store.get_import(views[1].import_id)
+    untouched = await store.get_import(views[2].import_id)
+    assert uploaded_first.state == uploaded_second.state == "uploaded"
+    assert uploaded_first.album_name == "Family"
+    assert uploaded_second.album_name == "Reference"
+    assert untouched.state == "ready" and untouched.album_name is None
+    assert photos.calls == ["Family", "Reference"]
+    for uploaded in (uploaded_first, uploaded_second):
+        control = channel.messages[uploaded.control_message_id]
+        buttons = {child.label: child for child in control.edits[-1]["view"].children}
+        assert buttons["Open album"].url == uploaded.album_url
+    assert photo_messages[0][1]["view"].import_id != photo_messages[1][1]["view"].import_id
+
+    restored_loader = Loader(prepared)
+    restored_photos = UploadPhotos(store)
+    restored = HarnessPicoBot(
+        config,
+        store,
+        restored_loader,
+        restored_photos,
+        channels=(channel,),
+    )
+    await restored.setup_hook()
+    assert len(restored.persistent_views) == 1
+    assert restored.persistent_views[0].import_id == untouched.id
+    await restored.close()
+
+
+class FailingSecondPhotoChannel(Channel):
+    def __init__(self):
+        super().__init__()
+        self.photo_count = 0
+
+    async def send(self, content=None, **kwargs):
+        files = kwargs.get("files", [])
+        if files:
+            self.photo_count += 1
+        if files and self.photo_count == 2:
+            for file in files:
+                file.close()
+            response = SimpleNamespace(status=413, reason="Payload Too Large")
+            raise discord.HTTPException(response, "attachment rejected")
+        return await super().send(content, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_webpage_child_delivery_failure_preserves_sibling_controls_and_bytes(
+    tmp_path: Path,
+):
+    config = settings(tmp_path)
+    store = PicoStore(config.data_path)
+    await store.initialize()
+    prepared = prepared_webpage(tmp_path, count=3)
+    channel = FailingSecondPhotoChannel()
+    bot = HarnessPicoBot(
+        config,
+        store,
+        Loader(prepared),
+        UploadPhotos(store),
+        channels=(channel,),
+    )
+
+    await bot._prepare_message(
+        IncomingMessage("https://publisher.example/story", channel),
+        "https://publisher.example/story",
+    )
+
+    delivered = [
+        payload
+        for payload in channel.sent
+        if isinstance(payload[1].get("view"), PicoControlView)
+    ]
+    assert len(delivered) == 2
+    assert channel.sent[-1][0].startswith("Webpage import: 3 prepared, 2 delivered")
+    first_id = delivered[0][1]["view"].import_id
+    failed = await store.get_import(first_id + 1)
+    assert failed.state == "failed"
+    assert not prepared.files[1].path.exists()
+    assert prepared.files[0].path.exists()
+    assert prepared.files[2].path.exists()

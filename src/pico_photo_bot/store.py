@@ -17,6 +17,54 @@ from .models import (
 )
 
 UTC = timezone.utc
+SCHEMA_VERSION = 1
+_CREATE_SCHEMA = """
+CREATE TABLE pico_imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    submitter_id INTEGER NOT NULL,
+    source_kind TEXT NOT NULL CHECK(source_kind IN ('reddit', 'direct', 'webpage')),
+    source_url TEXT NOT NULL,
+    attribution_label TEXT NOT NULL,
+    attribution_sentence TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(
+        state IN ('preparing', 'ready', 'uploading', 'failed', 'uploaded', 'expired')
+    ),
+    album_name TEXT,
+    album_id TEXT,
+    album_url TEXT,
+    control_channel_id INTEGER,
+    control_message_id INTEGER,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX pico_imports_state_idx ON pico_imports(state, updated_at);
+CREATE TABLE pico_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL REFERENCES pico_imports(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(
+        state IN ('pending', 'tokenized', 'failed', 'uploaded')
+    ),
+    upload_token TEXT,
+    upload_token_at TEXT,
+    media_item_id TEXT,
+    media_item_url TEXT,
+    last_error TEXT,
+    UNIQUE(import_id, ordinal),
+    UNIQUE(import_id, filename)
+);
+CREATE TABLE pico_albums (
+    name TEXT PRIMARY KEY,
+    album_id TEXT NOT NULL,
+    product_url TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
 
 
 class PicoStore:
@@ -37,18 +85,47 @@ class PicoStore:
     async def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         async with self._connect() as db:
-            await db.executescript(
+            await db.execute("PRAGMA journal_mode = WAL")
+            table = await (
+                await db.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'pico_imports'"
+                )
+            ).fetchone()
+            version_row = await (await db.execute("PRAGMA user_version")).fetchone()
+            version = int(version_row[0])
+            if table is None:
+                await db.executescript(_CREATE_SCHEMA)
+                await db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                await db.commit()
+            elif version == 0:
+                await self._migrate_legacy_schema(db)
+            elif version != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Unsupported Pico database schema version {version}; "
+                    f"expected {SCHEMA_VERSION}."
+                )
+
+    async def _migrate_legacy_schema(self, db: aiosqlite.Connection) -> None:
+        await db.execute("PRAGMA foreign_keys = OFF")
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
                 """
-                PRAGMA journal_mode = WAL;
-                CREATE TABLE IF NOT EXISTS pico_imports (
+                CREATE TABLE pico_imports_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     submitter_id INTEGER NOT NULL,
-                    source_kind TEXT NOT NULL CHECK(source_kind IN ('reddit', 'direct')),
+                    source_kind TEXT NOT NULL CHECK(
+                        source_kind IN ('reddit', 'direct', 'webpage')
+                    ),
                     source_url TEXT NOT NULL,
                     attribution_label TEXT NOT NULL,
                     attribution_sentence TEXT NOT NULL,
                     state TEXT NOT NULL CHECK(
-                        state IN ('preparing', 'ready', 'uploading', 'failed', 'uploaded', 'expired')
+                        state IN (
+                            'preparing', 'ready', 'uploading',
+                            'failed', 'uploaded', 'expired'
+                        )
                     ),
                     album_name TEXT,
                     album_id TEXT,
@@ -58,37 +135,42 @@ class PicoStore:
                     last_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS pico_imports_state_idx
-                    ON pico_imports(state, updated_at);
-                CREATE TABLE IF NOT EXISTS pico_files (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    import_id INTEGER NOT NULL REFERENCES pico_imports(id) ON DELETE CASCADE,
-                    ordinal INTEGER NOT NULL,
-                    path TEXT NOT NULL,
-                    filename TEXT NOT NULL,
-                    mime_type TEXT NOT NULL,
-                    size INTEGER NOT NULL,
-                    state TEXT NOT NULL CHECK(
-                        state IN ('pending', 'tokenized', 'failed', 'uploaded')
-                    ),
-                    upload_token TEXT,
-                    upload_token_at TEXT,
-                    media_item_id TEXT,
-                    media_item_url TEXT,
-                    last_error TEXT,
-                    UNIQUE(import_id, ordinal),
-                    UNIQUE(import_id, filename)
-                );
-                CREATE TABLE IF NOT EXISTS pico_albums (
-                    name TEXT PRIMARY KEY,
-                    album_id TEXT NOT NULL,
-                    product_url TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
+                )
                 """
             )
+            await db.execute(
+                """
+                INSERT INTO pico_imports_new(
+                    id, submitter_id, source_kind, source_url,
+                    attribution_label, attribution_sentence, state,
+                    album_name, album_id, album_url, control_channel_id,
+                    control_message_id, last_error, created_at, updated_at
+                )
+                SELECT
+                    id, submitter_id, source_kind, source_url,
+                    attribution_label, attribution_sentence, state,
+                    album_name, album_id, album_url, control_channel_id,
+                    control_message_id, last_error, created_at, updated_at
+                FROM pico_imports
+                """
+            )
+            await db.execute("DROP INDEX IF EXISTS pico_imports_state_idx")
+            await db.execute("DROP TABLE pico_imports")
+            await db.execute("ALTER TABLE pico_imports_new RENAME TO pico_imports")
+            await db.execute(
+                "CREATE INDEX pico_imports_state_idx "
+                "ON pico_imports(state, updated_at)"
+            )
+            await db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.execute("PRAGMA foreign_keys = ON")
+        problems = await (await db.execute("PRAGMA foreign_key_check")).fetchall()
+        if problems:
+            raise RuntimeError("Pico database migration failed its foreign-key check.")
 
     async def create_import(self, submitter_id: int, source_url: str) -> PicoImport:
         now = _now_text()
@@ -154,6 +236,110 @@ class PicoStore:
             )
             await db.commit()
         return await self.get_import(import_id)
+    async def mark_webpage_ready(
+        self, import_id: int, prepared: PreparedImport
+    ) -> tuple[PicoImport, ...]:
+        if prepared.source.kind != "webpage":
+            raise ValueError("Prepared source is not a webpage.")
+        files_by_ordinal = {item.ordinal: item for item in prepared.files}
+        images_by_ordinal = {item.ordinal: item for item in prepared.source.images}
+        ordinals = [item.ordinal for item in prepared.source.images]
+        if (
+            not ordinals
+            or len(files_by_ordinal) != len(prepared.files)
+            or len(images_by_ordinal) != len(prepared.source.images)
+            or set(files_by_ordinal) != set(images_by_ordinal)
+            or any(
+                not image.attribution_label or not image.attribution_sentence
+                for image in prepared.source.images
+            )
+        ):
+            raise ValueError(
+                "Each webpage photo must map to one uniquely attributed prepared file."
+            )
+        now = _now_text()
+        child_ids: list[int] = []
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            original = await (
+                await db.execute(
+                    "SELECT * FROM pico_imports WHERE id = ? AND state = 'preparing'",
+                    (import_id,),
+                )
+            ).fetchone()
+            if original is None:
+                await db.rollback()
+                return ()
+            try:
+                for index, ordinal in enumerate(ordinals):
+                    image = images_by_ordinal[ordinal]
+                    file = files_by_ordinal[ordinal]
+                    if index == 0:
+                        cursor = await db.execute(
+                            """
+                            UPDATE pico_imports
+                            SET source_kind = 'webpage', source_url = ?,
+                                attribution_label = ?, attribution_sentence = ?,
+                                state = 'ready', last_error = NULL, updated_at = ?
+                            WHERE id = ? AND state = 'preparing'
+                            """,
+                            (
+                                prepared.source.canonical_url,
+                                image.attribution_label,
+                                image.attribution_sentence,
+                                now,
+                                import_id,
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            raise RuntimeError("Original webpage import changed during preparation.")
+                        child_id = import_id
+                    else:
+                        cursor = await db.execute(
+                            """
+                            INSERT INTO pico_imports(
+                                submitter_id, source_kind, source_url,
+                                attribution_label, attribution_sentence, state,
+                                created_at, updated_at
+                            ) VALUES (?, 'webpage', ?, ?, ?, 'ready', ?, ?)
+                            """,
+                            (
+                                original["submitter_id"],
+                                prepared.source.canonical_url,
+                                image.attribution_label,
+                                image.attribution_sentence,
+                                original["created_at"],
+                                now,
+                            ),
+                        )
+                        child_id = int(cursor.lastrowid)
+                    await db.execute(
+                        """
+                        INSERT INTO pico_files(
+                            import_id, ordinal, path, filename, mime_type, size, state
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                        """,
+                        (
+                            child_id,
+                            file.ordinal,
+                            str(file.path),
+                            file.filename,
+                            file.mime_type,
+                            file.size,
+                        ),
+                    )
+                    child_ids.append(child_id)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        children = []
+        for child_id in child_ids:
+            child = await self.get_import(child_id)
+            assert child is not None
+            children.append(child)
+        return tuple(children)
+
 
     async def mark_preparation_failed(self, import_id: int, error: str) -> bool:
         return await self._transition(
@@ -523,5 +709,14 @@ def _now_text() -> str:
 
 async def _delete_import_bytes(item: PicoImport) -> None:
     parents = {file.path.parent for file in item.files}
+    for file in item.files:
+        await asyncio.to_thread(file.path.unlink, missing_ok=True)
     for parent in parents:
-        await asyncio.to_thread(shutil.rmtree, parent, True)
+        await asyncio.to_thread(_remove_empty_directory, parent)
+
+
+def _remove_empty_directory(path: Path) -> None:
+    try:
+        path.rmdir()
+    except (FileNotFoundError, OSError):
+        pass

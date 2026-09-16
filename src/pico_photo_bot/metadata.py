@@ -35,6 +35,7 @@ class PicoMetadataWriter:
             self.executable,
             "-overwrite_original",
             "-P",
+            "-m",
             f"-XMP-dc:Description={attribution}",
             f"-EXIF:ImageDescription={attribution}",
             f"-EXIF:UserComment={attribution}",
@@ -67,6 +68,7 @@ class PicoMetadataWriter:
                     "-XMP-dc:Description",
                     "-XMP-dc:Source",
                     "-XMP-dc:Subject",
+                    "-IPTC:Source",
                     str(destination),
                 ],
                 check=True,
@@ -77,10 +79,15 @@ class PicoMetadataWriter:
             metadata = payload[0]
             subjects = metadata.get("XMP-dc:Subject")
             normalized_subjects = [subjects] if isinstance(subjects, str) else subjects
+            iptc_source_valid = (
+                destination.suffix.casefold() not in {".jpg", ".jpeg", ".png"}
+                or metadata.get("IPTC:Source") == source_url
+            )
             if (
                 metadata.get("XMP-dc:Description") != attribution
                 or metadata.get("XMP-dc:Source") != source_url
                 or normalized_subjects != [archive_search_tag]
+                or not iptc_source_valid
             ):
                 raise PicoMetadataError("ExifTool metadata verification failed.")
         except (

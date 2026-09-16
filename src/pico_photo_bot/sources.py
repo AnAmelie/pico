@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import html
 import os
 import re
@@ -14,6 +15,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 from PIL import Image, UnidentifiedImageError
 
+from .attribution import PhotographerResearcher, resolve_attributions
 from .models import PreparedFile, PreparedImport, SourceImage, SourcePost
 from .public_url import (
     PublicUrlError,
@@ -22,6 +24,7 @@ from .public_url import (
     resolve_host,
     validate_public_http_url,
 )
+from .webpage import WebpageError, WebpageRenderer
 
 MAX_REDIRECTS = 5
 MAX_IMAGE_BYTES = 10_000_000
@@ -238,6 +241,13 @@ class RedditPostClient:
         )
 
 
+@dataclass(frozen=True)
+class _DownloadedResource:
+    final_url: str
+    content_type: str
+    data: bytes
+
+
 class PicoMediaLoader:
     def __init__(
         self,
@@ -246,6 +256,8 @@ class PicoMediaLoader:
         archive_search_tag: str,
         client: Optional[httpx.AsyncClient] = None,
         resolver: Optional[Resolver] = None,
+        webpage_renderer: WebpageRenderer | None = None,
+        photographer_finder: PhotographerResearcher | None = None,
     ) -> None:
         self.reddit = reddit
         self.metadata_writer = metadata_writer
@@ -257,10 +269,19 @@ class PicoMediaLoader:
             follow_redirects=False,
         )
         self.resolver = resolver or resolve_host
+        self.webpage_renderer = webpage_renderer
+        self.photographer_finder = photographer_finder
 
     async def close(self) -> None:
+        closers = []
+        if self.webpage_renderer is not None:
+            closers.append(self.webpage_renderer.close())
+        if self.photographer_finder is not None:
+            closers.append(self.photographer_finder.close())
         if self._owns_client:
-            await self.client.aclose()
+            closers.append(self.client.aclose())
+        if closers:
+            await asyncio.gather(*closers, return_exceptions=True)
 
     async def prepare(self, url: str, destination: Path) -> PreparedImport:
         import_key = uuid.uuid4().hex
@@ -268,31 +289,52 @@ class PicoMediaLoader:
         staging = destination / f".staging-{import_key}"
         final = destination / import_key
         await asyncio.to_thread(staging.mkdir, parents=True, exist_ok=False)
+        omitted_count = 0
+        skipped_count = 0
         try:
             if is_reddit_post_url(url):
                 source = await self.reddit.resolve(url)
                 if len(source.images) > MAX_IMPORT_IMAGES:
                     raise PicoSourceError("An import may contain at most 20 images.")
-                downloaded = []
+                downloaded: list[
+                    tuple[SourceImage, Path, tuple[str, str] | None]
+                ] = []
                 for image in source.images:
                     raw_path = staging / f"raw-{image.ordinal}"
-                    _, data = await self._download(image.url)
-                    await asyncio.to_thread(raw_path.write_bytes, data)
-                    downloaded.append((image.ordinal, raw_path))
+                    resource = await self._download(image.url)
+                    await asyncio.to_thread(raw_path.write_bytes, resource.data)
+                    downloaded.append((image, raw_path, None))
             else:
+                resource = await self._download(url)
                 raw_path = staging / "raw-1"
-                final_url, data = await self._download(url)
-                await asyncio.to_thread(raw_path.write_bytes, data)
-                host = (urlsplit(final_url).hostname or "").casefold()
-                sentence = f"Source: {host} — {final_url}"
-                source = SourcePost(
-                    kind="direct",
-                    canonical_url=final_url,
-                    attribution_label=host,
-                    attribution_sentence=sentence,
-                    images=(SourceImage(1, final_url),),
-                )
-                downloaded = [(1, raw_path)]
+                await asyncio.to_thread(raw_path.write_bytes, resource.data)
+                inspected: tuple[str, str] | None = None
+                try:
+                    inspected = await asyncio.to_thread(_inspect_image, raw_path)
+                except PicoSourceError as invalid_image:
+                    if not _looks_like_html(resource):
+                        raise invalid_image
+                if inspected is None:
+                    raw_path.unlink(missing_ok=True)
+                    (
+                        source,
+                        downloaded,
+                        omitted_count,
+                        skipped_count,
+                    ) = await self._prepare_webpage(resource.final_url, staging)
+                else:
+                    host = (urlsplit(resource.final_url).hostname or "").casefold()
+                    sentence = f"Source: {host} — {resource.final_url}"
+                    image = SourceImage(1, resource.final_url)
+                    source = SourcePost(
+                        kind="direct",
+                        canonical_url=resource.final_url,
+                        attribution_label=host,
+                        attribution_sentence=sentence,
+                        images=(image,),
+                    )
+                    downloaded = [(image, raw_path, inspected)]
+
             prepared: list[PreparedFile] = []
             total_size = 0
             source_stem = (
@@ -301,35 +343,111 @@ class PicoMediaLoader:
                 else source.attribution_label
             )
             stem = f"{self.archive_search_tag}-{_safe_stem(source_stem)}"
-            for ordinal, raw_path in downloaded:
-                extension, mime_type = await asyncio.to_thread(_inspect_image, raw_path)
-                filename = _attachment_name(stem, ordinal, extension)
+            for image, raw_path, inspected in downloaded:
+                extension, mime_type = (
+                    inspected
+                    if inspected is not None
+                    else await asyncio.to_thread(_inspect_image, raw_path)
+                )
+                filename = _attachment_name(stem, image.ordinal, extension)
                 output_path = staging / filename
                 await asyncio.to_thread(
                     self.metadata_writer.write,
                     raw_path,
                     output_path,
-                    source.attribution_sentence,
+                    image.attribution_sentence or source.attribution_sentence,
                     source.canonical_url,
                     self.archive_search_tag,
                 )
                 size = output_path.stat().st_size
                 if size > MAX_IMAGE_BYTES:
-                    raise PicoSourceError("Prepared image exceeds the 10,000,000-byte limit.")
+                    raise PicoSourceError(
+                        "Prepared image exceeds the 10,000,000-byte limit."
+                    )
                 total_size += size
                 if total_size > MAX_IMPORT_BYTES:
                     raise PicoSourceError("Import exceeds the 100,000,000-byte limit.")
                 raw_path.unlink()
                 prepared.append(
-                    PreparedFile(ordinal, final / filename, filename, mime_type, size)
+                    PreparedFile(
+                        image.ordinal, final / filename, filename, mime_type, size
+                    )
                 )
             await asyncio.to_thread(os.replace, staging, final)
-            return PreparedImport(import_key, source, tuple(prepared))
+            return PreparedImport(
+                import_key,
+                source,
+                tuple(prepared),
+                omitted_count=omitted_count,
+                skipped_count=skipped_count,
+            )
         except Exception:
             await asyncio.to_thread(shutil.rmtree, staging, True)
             raise
 
-    async def _download(self, url: str) -> tuple[str, bytes]:
+    async def _prepare_webpage(
+        self, url: str, staging: Path
+    ) -> tuple[
+        SourcePost,
+        list[tuple[SourceImage, Path, tuple[str, str] | None]],
+        int,
+        int,
+    ]:
+        if self.webpage_renderer is None:
+            raise PicoSourceError(
+                "Webpage imports require Pico's optional webpage support; install "
+                "pico-photo-bot[webpage] and Chromium."
+            )
+        try:
+            page = await self.webpage_renderer.render(url)
+            canonical_url = normalize_public_http_url(page.canonical_url)
+            await validate_public_http_url(canonical_url, self.resolver)
+        except (WebpageError, PublicUrlError) as exc:
+            raise PicoSourceError(str(exc)) from exc
+        attributions = await resolve_attributions(page, self.photographer_finder)
+        host = (urlsplit(canonical_url).hostname or "webpage").casefold()
+        fallback_sentence = f"Source: {host} — {canonical_url}"
+        selected = page.candidates[:MAX_IMPORT_IMAGES]
+        omitted_count = max(0, page.total_count - len(selected))
+        skipped_count = 0
+        downloaded: list[
+            tuple[SourceImage, Path, tuple[str, str] | None]
+        ] = []
+        images: list[SourceImage] = []
+        for candidate in selected:
+            raw_path = staging / f"raw-{candidate.ordinal}"
+            try:
+                resource = await self._download(candidate.url)
+                await asyncio.to_thread(raw_path.write_bytes, resource.data)
+                inspected = await asyncio.to_thread(_inspect_image, raw_path)
+            except (PicoSourceError, OSError):
+                raw_path.unlink(missing_ok=True)
+                skipped_count += 1
+                continue
+            attribution = attributions[candidate.ordinal]
+            image = SourceImage(
+                candidate.ordinal,
+                resource.final_url,
+                caption=candidate.caption or None,
+                attribution_label=attribution.label,
+                attribution_sentence=attribution.sentence,
+            )
+            images.append(image)
+            downloaded.append((image, raw_path, inspected))
+        if not downloaded:
+            raise PicoSourceError(
+                "The webpage did not contain any downloadable JPEG, PNG, or WebP photos."
+            )
+        source = SourcePost(
+            kind="webpage",
+            canonical_url=canonical_url,
+            attribution_label=host,
+            attribution_sentence=fallback_sentence,
+            images=tuple(images),
+        )
+        return source, downloaded, omitted_count, skipped_count
+
+    async def _download(self, url: str) -> _DownloadedResource:
         try:
             current = normalize_public_http_url(url)
         except PublicUrlError as exc:
@@ -358,20 +476,38 @@ class PicoMediaLoader:
                         and content_length.isdigit()
                         and int(content_length) > MAX_IMAGE_BYTES
                     ):
-                        raise PicoSourceError("Image exceeds the 10,000,000-byte limit.")
-                    chunks: list[bytes] = []
-                    size = 0
+                        raise PicoSourceError(
+                            "Image exceeds the 10,000,000-byte limit."
+                        )
+                    data = bytearray()
                     async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        if size > MAX_IMAGE_BYTES:
-                            raise PicoSourceError("Image exceeds the 10,000,000-byte limit.")
-                        chunks.append(chunk)
-                    return current, b"".join(chunks)
+                        data.extend(chunk)
+                        if len(data) > MAX_IMAGE_BYTES:
+                            raise PicoSourceError(
+                                "Image exceeds the 10,000,000-byte limit."
+                            )
+                    return _DownloadedResource(
+                        current,
+                        response.headers.get("content-type", "")
+                        .partition(";")[0]
+                        .strip()
+                        .casefold(),
+                        bytes(data),
+                    )
             except PublicUrlError as exc:
                 raise PicoSourceError(str(exc)) from exc
             except httpx.HTTPError as exc:
-                raise PicoSourceError("Image download failed; check the link and try again.") from exc
+                raise PicoSourceError(
+                    "Image download failed; check the link and try again."
+                ) from exc
         raise PicoSourceError("Image URL exceeded 5 redirects.")
+
+
+def _looks_like_html(resource: _DownloadedResource) -> bool:
+    if resource.content_type in {"text/html", "application/xhtml+xml"}:
+        return True
+    prefix = resource.data.lstrip()[:256].lower()
+    return prefix.startswith((b"<!doctype html", b"<html"))
 
 
 def _inspect_image(path: Path) -> tuple[str, str]:

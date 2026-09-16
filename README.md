@@ -1,19 +1,23 @@
 # Pico Photo Bot
 
-Pico is a private Discord worker that accepts one Reddit post URL or direct image URL, downloads supported still images, embeds source attribution with ExifTool, returns the prepared files to Discord, and offers a persistent button for adding them to a curated Google Photos album.
+Pico is a private Discord worker that accepts one public webpage, Reddit post, or direct image URL, downloads supported still images, embeds source attribution with ExifTool, returns the prepared files to Discord, and offers persistent controls for adding them to curated Google Photos albums.
 
-Pico is deterministic and does not use an LLM. It accepts messages only from configured users in one configured channel. It has no slash commands and exposes no HTTP port.
+Pico accepts messages only from configured users in one configured channel. It has no slash commands and exposes no HTTP port. Webpage attribution is deterministic when publishers expose credits; optional OpenRouter research is used only for photos whose publisher credit is missing.
 
 ## Behavior and limits
 
 Paste exactly one supported URL as the entire Discord message. Discord `<https://...>` wrappers are accepted. Pico ignores ordinary conversation and rejects extra text or multiple links rather than guessing.
 
-For direct image URLs, Pico follows at most five redirects, rejects URLs resolving to private or otherwise non-public networks, and records the final hostname and URL as attribution. With Reddit API credentials, Pico uses app-only OAuth and the Reddit API rather than scraping HTML. Reddit galleries retain API order and use the post author and canonical permalink. Without Reddit credentials, Pico runs in direct-image-only mode and gives an actionable response for Reddit links.
+For direct image URLs, Pico follows at most five redirects, rejects URLs resolving to private or otherwise non-public networks, and records the final hostname and URL as attribution. With Reddit API credentials, Pico uses app-only OAuth and the Reddit API rather than scraping HTML. Reddit galleries retain API order and use the post author and canonical permalink. Without Reddit credentials, Reddit links return an actionable error while direct-image and webpage support remain available.
+
+For public webpages, the optional Playwright renderer discovers qualifying editorial photos in article content and accessible galleries, including JavaScript-driven carousels. Logos, icons, advertisements, avatars, placeholders, thumbnails, data/blob URLs, animations, and unsupported formats are excluded. Carousel photos retain their slide-specific caption and credit. Pico prepares the first 20 qualifying photos in page/gallery order and reports skipped and omitted counts.
+
+Every webpage photo becomes an independent Discord attachment and approval control. Choosing an album uploads only that photo; sibling photos can be approved to different albums, left untouched, retried, or expired independently. Reddit and direct-image imports retain their existing aggregate control.
 
 Supported input formats and limits:
 
 - JPEG, PNG, and single-frame WebP;
-- at most 20 images per import;
+- at most 20 qualifying images per import; excess webpage photos are reported as omitted;
 - at most 10,000,000 bytes per source or prepared image;
 - at most 100,000,000 prepared bytes per import;
 - at most 50,000,000 decoded pixels per image;
@@ -22,6 +26,14 @@ Supported input formats and limits:
 ExifTool writes the attribution sentence, source URL, and stable archive tag without re-encoding image pixels. JPEG and PNG receive XMP, EXIF, and IPTC metadata where supported; WebP receives XMP metadata. Pico verifies the written XMP values before delivering a file.
 
 Prepared but unused imports expire after seven days. Successful Google Photos uploads delete local image bytes immediately. Source details, upload state, album mapping, persistent Discord control IDs, upload tokens, and Google item IDs remain in SQLite so interrupted and partial uploads can resume safely. The first album selection permanently locks an import to that album.
+
+### Webpage safety and optional attribution research
+
+Webpage rendering uses one shared headless Chromium process and a fresh cookie-free context per submission. Pico disables proxy inheritance and validates every document, script, stylesheet, XHR/fetch, and image request against public DNS addresses. Redirects are revalidated; private/reserved destinations, popups, downloads, fonts, audio, video, unsupported schemes, and requests beyond bounded deadlines are blocked. Source images still pass the normal redirect, byte, pixel, animation, and actual-format checks.
+
+Page rendering is optional. A base install without the `webpage` extra continues to support Reddit and direct images and returns an actionable error only for webpage submissions. Renderer launch failures, page timeouts, bot challenges, inaccessible galleries, and pages without qualifying public still images are scoped to that submission and do not stop Pico.
+
+`OPENROUTER_API_KEY` is optional. When present, Pico sends one bounded request per page containing only the page URL/title and unresolved candidates' image URL, filename, alt text, caption, and nearby text. It does not send image bytes or the full page. Search is limited to 3 uses, 5 results per search, and 10 results total. Publisher credits always win. Timeouts, rate limits, invalid responses, unsupported model parameters, and missing credentials fail open to truthful source-page attribution. Page assets leave the host for rendering, and bounded unresolved attribution evidence leaves the host for OpenRouter search; operators should account for those disclosures and model/search costs.
 
 ## Discord application
 
@@ -37,12 +49,13 @@ Set `PICO_CHANNEL_ID` to that channel and include the same ID in `DISCORD_CHANNE
 
 ## Install locally
 
-Python 3.13 and ExifTool are required.
+Python 3.13 and ExifTool are required. Webpage imports additionally require Playwright and its Chromium browser.
 
 ```sh
 brew install exiftool
 python3.13 -m venv .venv
-.venv/bin/python -m pip install -e '.[dev]'
+.venv/bin/python -m pip install -e '.[dev,webpage]'
+.venv/bin/python -m playwright install chromium
 cp .env.example .env
 ```
 
@@ -67,6 +80,8 @@ The daemon never launches interactive OAuth. Missing or unusable credentials, a 
 | `PICO_REDDIT_CLIENT_ID` | No | Reddit script-application client ID. Set with the client secret. |
 | `PICO_REDDIT_CLIENT_SECRET` | No | Reddit script-application secret. Set with the client ID. |
 | `PICO_REDDIT_USER_AGENT` | With Reddit credentials | Descriptive Reddit API identity, for example `pico-photo-bot/0.1 by u/your-reddit-account`. |
+| `OPENROUTER_API_KEY` | No | Enables fallback-only photographer research for webpage photos lacking publisher credits. |
+| `PICO_OPENROUTER_MODEL` | No | Compatible OpenRouter model; defaults to `openai/gpt-5-nano`. |
 | `PICO_ALBUM_NAMES` | Yes | One to 25 unique, comma-separated Google Photos album titles. |
 | `PICO_ARCHIVE_SEARCH_TAG` | Yes | Stable `picoarc` plus 12 hexadecimal characters. Never change it after uploads exist. |
 | `PICO_DATA_PATH` | No | SQLite path; defaults to `data/pico.db`. |
@@ -112,12 +127,12 @@ docker compose build
 docker compose up -d
 ```
 
-The image uses Python 3.13 slim, installs ExifTool and timezone data, and runs as UID/GID 10001. The Compose service mounts the named `pico-data` volume at `/app/data`; it exposes no port and needs no domain or reverse proxy.
+The image uses Python 3.13 slim, installs ExifTool, Playwright Chromium and its system dependencies, proves Chromium launches as UID/GID 10001 during the build, and runs Pico as that non-root user. The Compose service mounts the named `pico-data` volume at `/app/data`; it exposes no port and needs no domain or reverse proxy.
 
 For Coolify:
 
 1. Create a Docker Compose resource from this repository and use `/docker-compose.yml`.
-2. Add the variables from `.env.example`. Mark the Discord token, Reddit secret, and both base64 OAuth values as secrets.
+2. Add the variables from `.env.example`. Mark the Discord token, Reddit secret, optional OpenRouter key, and both base64 OAuth values as secrets.
 3. Authorize locally with `pico-photo-bot-auth`.
 4. Copy each OAuth JSON file into its corresponding base64 variable without printing the value, for example on macOS:
 

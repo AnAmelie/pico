@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-SourceKind = Literal["reddit", "direct"]
+SourceKind = Literal["reddit", "direct", "webpage"]
 ImportState = Literal[
     "preparing", "ready", "uploading", "failed", "uploaded", "expired"
 ]
@@ -16,6 +16,9 @@ FileState = Literal["pending", "tokenized", "failed", "uploaded"]
 class SourceImage:
     ordinal: int
     url: str
+    caption: str | None = None
+    attribution_label: str | None = None
+    attribution_sentence: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,8 @@ class PreparedImport:
     import_key: str
     source: SourcePost
     files: tuple[PreparedFile, ...]
+    omitted_count: int = 0
+    skipped_count: int = 0
 
     @property
     def total_bytes(self) -> int:

@@ -33,7 +33,7 @@ def parse_submission_url(content: str) -> str | None:
     if not links:
         if "://" in candidate:
             raise PicoSubmissionError(
-                "Send one public HTTP(S) Reddit post or direct image URL per message."
+                "Send one public HTTP(S) webpage, Reddit post, or direct image URL per message."
             )
         return None
     if len(links) != 1 or links[0] != candidate or any(char.isspace() for char in candidate):
@@ -224,6 +224,51 @@ class PicoBot(discord.Client):
         try:
             async with message.channel.typing():
                 prepared = await self.media_loader.prepare(url, self.settings.media_path)
+            if prepared.source.kind == "webpage":
+                children = await self.store.mark_webpage_ready(item.id, prepared)
+                if not children:
+                    raise PicoSourceError("Prepared webpage photos could not be persisted.")
+                delivered = 0
+                for child in children:
+                    file = child.files[0]
+                    try:
+                        control = await message.channel.send(
+                            self._control_content(child),
+                            files=[discord.File(file.path, filename=file.filename)],
+                            view=PicoControlView(self, child.id),
+                        )
+                        if not await self.store.set_control_message(
+                            child.id, message.channel.id, control.id
+                        ):
+                            raise PicoSourceError(
+                                "Pico could not persist this photo's upload control."
+                            )
+                        delivered += 1
+                    except (discord.HTTPException, PicoSourceError) as exc:
+                        LOGGER.warning(
+                            "Pico Discord delivery failed for webpage child %s: %s",
+                            child.id,
+                            exc,
+                        )
+                        await self.store.mark_delivery_failed(
+                            child.id,
+                            "Discord rejected this photo; paste the webpage URL again "
+                            "after checking the channel upload limit.",
+                        )
+                        await self.store.delete_local_bytes(child.id)
+                summary = (
+                    f"Webpage import: {len(children)} prepared, {delivered} delivered, "
+                    f"{prepared.skipped_count} skipped, "
+                    f"{prepared.omitted_count} omitted by the 20-photo limit."
+                )
+                try:
+                    await message.channel.send(summary)
+                except discord.HTTPException:
+                    LOGGER.warning(
+                        "Pico could not deliver webpage summary for import %s", item.id
+                    )
+                return
+
             ready = await self.store.mark_ready(item.id, prepared)
             if ready is None:
                 raise PicoSourceError("Prepared import could not be persisted.")
@@ -423,6 +468,6 @@ class PicoBot(discord.Client):
     def _control_content(item: PicoImport) -> str:
         return (
             f"Source: {item.source_url}\n"
-            f"Attribution: {item.attribution_label}\n"
+            f"Attribution: {item.attribution_sentence}\n"
             f"Images: {len(item.files)}"
         )

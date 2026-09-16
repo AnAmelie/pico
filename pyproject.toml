@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1"]
+webpage = ["playwright>=1.52,<2"]
 
 [project.scripts]
 pico-photo-bot = "pico_photo_bot.main:main"

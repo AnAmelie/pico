@@ -22,6 +22,8 @@ OPTIONAL_ENV = (
     "PICO_MEDIA_PATH",
     "PICO_GOOGLE_CREDENTIALS_PATH",
     "PICO_GOOGLE_TOKEN_PATH",
+    "OPENROUTER_API_KEY",
+    "PICO_OPENROUTER_MODEL",
 )
 
 
@@ -50,6 +52,8 @@ def test_pico_settings_are_isolated_and_apply_defaults(monkeypatch):
     assert settings.google_credentials_path == Path("data/google-photos-credentials.json")
     assert settings.google_token_path == Path("data/google-photos-token.json")
     assert settings.log_level == "DEBUG"
+    assert settings.openrouter_api_key is None
+    assert settings.openrouter_model == "openai/gpt-5-nano"
 
 
 @pytest.mark.parametrize(
@@ -139,3 +143,24 @@ def test_pico_album_list_rejects_ambiguous_select_options(monkeypatch, value, me
     set_env(monkeypatch, PICO_ALBUM_NAMES=value)
     with pytest.raises(ValueError, match=message):
         PicoSettings.from_env()
+
+
+def test_openrouter_key_uses_default_model(monkeypatch):
+    set_env(monkeypatch, OPENROUTER_API_KEY=" secret ")
+
+    settings = PicoSettings.from_env()
+
+    assert settings.openrouter_api_key == "secret"
+    assert settings.openrouter_model == "openai/gpt-5-nano"
+
+
+def test_openrouter_model_can_be_overridden(monkeypatch):
+    set_env(
+        monkeypatch,
+        OPENROUTER_API_KEY="secret",
+        PICO_OPENROUTER_MODEL="provider/model",
+    )
+
+    settings = PicoSettings.from_env()
+
+    assert settings.openrouter_model == "provider/model"

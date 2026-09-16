@@ -75,6 +75,7 @@ def test_exiftool_round_trip_preserves_pixels_and_unrelated_metadata(
     if image_format in {"JPEG", "PNG"}:
         assert metadata["IPTC:Caption-Abstract"] == ATTRIBUTION
         assert metadata_values(metadata["IPTC:Keywords"]) == [ARCHIVE_TAG]
+        assert metadata["IPTC:Source"] == SOURCE_URL
     else:
         assert not any(key.startswith("IPTC:") for key in metadata)
     assert pixels_after == pixels_before

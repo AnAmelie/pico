@@ -102,6 +102,8 @@ class PicoSettings:
     google_credentials_path: Path
     google_token_path: Path
     log_level: str
+    openrouter_api_key: Optional[str] = None
+    openrouter_model: str = "openai/gpt-5-nano"
 
     @classmethod
     def from_env(cls) -> "PicoSettings":
@@ -158,4 +160,8 @@ class PicoSettings:
                 )
             ).expanduser(),
             log_level=_nonempty("LOG_LEVEL", "INFO").upper(),
+            openrouter_api_key=_optional_text("OPENROUTER_API_KEY"),
+            openrouter_model=_nonempty(
+                "PICO_OPENROUTER_MODEL", "openai/gpt-5-nano"
+            ),
         )

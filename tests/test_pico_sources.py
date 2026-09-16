@@ -13,6 +13,7 @@ from pico_photo_bot.sources import (
     PicoSourceError,
     RedditPostClient,
 )
+from pico_photo_bot.webpage import WebpageCandidate, WebpageResult
 ARCHIVE_TAG = "picoarc0123456789ab"
 
 
@@ -311,4 +312,184 @@ async def test_reddit_gallery_over_twenty_images_is_rejected_before_download(tmp
     with pytest.raises(PicoSourceError, match="at most 20"):
         await loader.prepare("https://reddit.com/comments/abc/title/", tmp_path)
     assert not tuple(tmp_path.iterdir())
+    await client.aclose()
+
+
+class FakeRenderer:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+        self.closed = False
+
+    async def render(self, url):
+        self.calls.append(url)
+        return self.result
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_html_dispatch_preserves_candidate_order_metadata_and_skips_private_images(
+    tmp_path: Path,
+):
+    page = WebpageResult(
+        "https://publisher.example/story",
+        "Story",
+        (
+            WebpageCandidate(1, "https://cdn.example/one.png", credit="Credit One"),
+            WebpageCandidate(2, "https://private.example/two.png", credit="Credit Two"),
+            WebpageCandidate(3, "https://cdn.example/three.png"),
+        ),
+        3,
+    )
+    renderer = FakeRenderer(page)
+    calls = []
+
+    async def resolver(host, port):
+        return ["127.0.0.1"] if host == "private.example" else ["93.184.216.34"]
+
+    def handler(request):
+        calls.append(str(request.url))
+        if request.url.host == "publisher.example":
+            return httpx.Response(
+                200, headers={"content-type": "text/html"}, content=b"<html></html>"
+            )
+        return httpx.Response(200, content=image_bytes("PNG"))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    metadata = CopyMetadata()
+    loader = PicoMediaLoader(
+        RedditPostClient(None, None, None, client, resolver),
+        metadata,
+        ARCHIVE_TAG,
+        client,
+        resolver,
+        renderer,
+    )
+
+    prepared = await loader.prepare("https://publisher.example/story", tmp_path)
+
+    assert prepared.source.kind == "webpage"
+    assert [item.ordinal for item in prepared.source.images] == [1, 3]
+    assert [item.ordinal for item in prepared.files] == [1, 3]
+    assert prepared.skipped_count == 1
+    assert prepared.omitted_count == 0
+    assert metadata.writes == [
+        (
+            "Photo credit: Credit One — https://publisher.example/story",
+            "https://publisher.example/story",
+            ARCHIVE_TAG,
+        ),
+        (
+            "Source: publisher.example — https://publisher.example/story",
+            "https://publisher.example/story",
+            ARCHIVE_TAG,
+        ),
+    ]
+    assert "https://private.example/two.png" not in calls
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_webpage_fails_atomically_when_no_candidate_is_a_valid_image(
+    tmp_path: Path,
+):
+    renderer = FakeRenderer(
+        WebpageResult(
+            "https://publisher.example/story",
+            "Story",
+            (WebpageCandidate(1, "https://cdn.example/not-image"),),
+            1,
+        )
+    )
+
+    def handler(request):
+        if request.url.host == "publisher.example":
+            return httpx.Response(
+                200, headers={"content-type": "text/html"}, content=b"<html></html>"
+            )
+        return httpx.Response(200, content=b"not an image")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    loader = PicoMediaLoader(
+        RedditPostClient(None, None, None, client, public_resolver),
+        CopyMetadata(),
+        ARCHIVE_TAG,
+        client,
+        public_resolver,
+        renderer,
+    )
+
+    with pytest.raises(PicoSourceError, match="did not contain any downloadable"):
+        await loader.prepare("https://publisher.example/story", tmp_path)
+
+    assert not tuple(tmp_path.iterdir())
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_webpage_retains_first_twenty_and_reports_omitted_count(tmp_path: Path):
+    renderer = FakeRenderer(
+        WebpageResult(
+            "https://publisher.example/story",
+            "Story",
+            tuple(
+                WebpageCandidate(index, f"https://cdn.example/{index}.png")
+                for index in range(1, 26)
+            ),
+            25,
+        )
+    )
+
+    def handler(request):
+        if request.url.host == "publisher.example":
+            return httpx.Response(
+                200, headers={"content-type": "text/html"}, content=b"<html></html>"
+            )
+        return httpx.Response(200, content=image_bytes("PNG"))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    loader = PicoMediaLoader(
+        RedditPostClient(None, None, None, client, public_resolver),
+        CopyMetadata(),
+        ARCHIVE_TAG,
+        client,
+        public_resolver,
+        renderer,
+    )
+
+    prepared = await loader.prepare("https://publisher.example/story", tmp_path)
+
+    assert [file.ordinal for file in prepared.files] == list(range(1, 21))
+    assert prepared.omitted_count == 5
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_renderer_unavailability_does_not_poison_later_direct_import(
+    tmp_path: Path,
+):
+    def handler(request):
+        if request.url.path == "/story":
+            return httpx.Response(
+                200, headers={"content-type": "text/html"}, content=b"<html></html>"
+            )
+        return httpx.Response(200, content=image_bytes("PNG"))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    loader = PicoMediaLoader(
+        RedditPostClient(None, None, None, client, public_resolver),
+        CopyMetadata(),
+        ARCHIVE_TAG,
+        client,
+        public_resolver,
+    )
+
+    with pytest.raises(PicoSourceError, match="optional webpage support"):
+        await loader.prepare("https://publisher.example/story", tmp_path)
+    prepared = await loader.prepare("https://publisher.example/direct", tmp_path)
+
+    assert prepared.source.kind == "direct"
+    assert prepared.files[0].path.exists()
     await client.aclose()
